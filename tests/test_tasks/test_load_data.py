@@ -4,6 +4,9 @@ import pytest
 from datasets import Dataset, DatasetDict
 
 import mteb
+from mteb.abstasks.abstask import AbsTask
+from mteb.abstasks.task_metadata import TaskMetadata
+from tests.mock_tasks import general_args
 
 
 @pytest.mark.parametrize(
@@ -50,3 +53,39 @@ def test_multilingual_retrieval_load_data(task):
     assert mock_load.called
     assert task.dataset is not None
     assert len(task.dataset) == 1
+
+
+class _DummyTaskWithoutNumProc(AbsTask):
+    metadata = TaskMetadata(
+        name="DummyTaskWithoutNumProc",
+        type="Classification",
+        main_score="accuracy",
+        **general_args,
+    )
+
+    def __init__(self):
+        super().__init__()
+        self.transform_called = False
+
+    def dataset_transform(self):
+        self.transform_called = True
+
+    def _evaluate_subset(self, *args, **kwargs):
+        del args, kwargs
+        return {"main_score": 1.0}
+
+    def _calculate_descriptive_statistics_from_split(self, *args, **kwargs):
+        del args, kwargs
+        return {}
+
+
+def test_load_data_handles_dataset_transform_without_num_proc():
+    task = _DummyTaskWithoutNumProc()
+    dummy_dataset = DatasetDict({"test": Dataset.from_dict({"text": ["test"]})})
+
+    with patch("mteb.abstasks.abstask.load_dataset") as mock_load:
+        mock_load.return_value = dummy_dataset
+        task.load_data(num_proc=4)
+
+    assert mock_load.called
+    assert task.transform_called

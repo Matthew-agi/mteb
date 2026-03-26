@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import tempfile
@@ -40,6 +41,20 @@ if TYPE_CHECKING:
     from mteb.types.statistics import DescriptiveStatistics, SplitDescriptiveStatistics
 
 logger = logging.getLogger(__name__)
+
+
+def _dataset_transform_accepts_num_proc(dataset_transform: Any) -> bool:
+    try:
+        sig = inspect.signature(dataset_transform)
+    except (TypeError, ValueError):
+        return True
+
+    for param in sig.parameters.values():
+        if param.kind == inspect.Parameter.VAR_KEYWORD:
+            return True
+        if param.name == "num_proc":
+            return True
+    return False
 
 
 def _multilabel_subsampling(
@@ -355,7 +370,10 @@ class AbsTask(ABC):
         else:
             # some of monolingual datasets explicitly adding the split name to the dataset name
             self.dataset = load_dataset(**self.metadata.dataset, num_proc=num_proc)
-        self.dataset_transform(num_proc=num_proc)
+        if _dataset_transform_accepts_num_proc(self.dataset_transform):
+            self.dataset_transform(num_proc=num_proc)
+        else:
+            self.dataset_transform()
         self.data_loaded = True
 
     def fast_load(self) -> None:
