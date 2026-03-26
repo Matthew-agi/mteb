@@ -426,9 +426,12 @@ class HeARS11AudioWrapper(AbsEncoder):
                 if audio_items is None:
                     raise ValueError("Expected an audio batch, but the dataloader batch has no `audio` key.")
 
-                if self.sliding_window:
-                    for audio_item in audio_items:
-                        arr, sr = self._extract_audio(audio_item)
+                per_clip_audio: list[torch.Tensor] = []
+                per_clip_owner: list[int] = []
+                needed_per_owner: list[int] = []
+                for owner, audio_item in enumerate(audio_items):
+                    arr, sr = self._extract_audio(audio_item)
+                    if self.sliding_window:
                         clips = _prep_audio_sliding_windows(
                             arr,
                             sr,
@@ -436,36 +439,15 @@ class HeARS11AudioWrapper(AbsEncoder):
                             clip_samples=self.clip_samples,
                             hop_samples=self.window_hop_samples,
                         )
-                        emb_sum: torch.Tensor | None = None
-                        emb_count = 0
-                        for start in range(0, int(clips.shape[0]), max_batch_size):
-                            clip_batch = clips[start : start + max_batch_size]
-                            emb = self._embed_batch(clip_batch)
-                            batch_sum = emb.sum(dim=0)
-                            emb_sum = batch_sum.clone() if emb_sum is None else emb_sum + batch_sum
-                            emb_count += int(emb.shape[0])
-                        if emb_sum is None or emb_count != int(clips.shape[0]):
-                            raise RuntimeError(
-                                "Failed to finalize sliding-window embedding: "
-                                f"needed={int(clips.shape[0])} seen={emb_count}"
-                            )
-                        outputs.append((emb_sum / float(emb_count)).to(torch.float32))
-                        self._update_progress(progress_bar, 1)
-                    continue
-
-                per_clip_audio: list[torch.Tensor] = []
-                per_clip_owner: list[int] = []
-                needed_per_owner: list[int] = []
-                for owner, audio_item in enumerate(audio_items):
-                    arr, sr = self._extract_audio(audio_item)
-                    clips = _prep_audio_clips(
-                        arr,
-                        sr,
-                        target_sr=self.target_sr,
-                        clip_samples=self.clip_samples,
-                        crop=self.crop,
-                        full_clip=self.full_clip,
-                    )
+                    else:
+                        clips = _prep_audio_clips(
+                            arr,
+                            sr,
+                            target_sr=self.target_sr,
+                            clip_samples=self.clip_samples,
+                            crop=self.crop,
+                            full_clip=self.full_clip,
+                        )
                     needed_per_owner.append(int(clips.shape[0]))
                     for clip in clips:
                         per_clip_audio.append(clip)
