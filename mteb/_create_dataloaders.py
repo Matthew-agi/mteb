@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import io
 import logging
 import math
@@ -173,14 +174,23 @@ def _maybe_disable_audio_decoding(
     feature = dataset.features.get(audio_column_name)
     if not isinstance(feature, Audio) or not getattr(feature, "decode", False):
         return dataset
+    audio_kwargs: dict[str, Any] = {}
+    try:
+        audio_signature = inspect.signature(Audio)
+        supported_params = set(audio_signature.parameters)
+    except Exception:
+        supported_params = {"sampling_rate", "decode", "id"}
+    if "sampling_rate" in supported_params:
+        audio_kwargs["sampling_rate"] = getattr(feature, "sampling_rate", None)
+    if "mono" in supported_params:
+        audio_kwargs["mono"] = getattr(feature, "mono", True)
+    if "decode" in supported_params:
+        audio_kwargs["decode"] = False
+    if "id" in supported_params:
+        audio_kwargs["id"] = getattr(feature, "id", None)
     return dataset.cast_column(
         audio_column_name,
-        Audio(
-            sampling_rate=getattr(feature, "sampling_rate", None),
-            mono=getattr(feature, "mono", True),
-            decode=False,
-            id=getattr(feature, "id", None),
-        ),
+        Audio(**audio_kwargs),
     )
 
 
