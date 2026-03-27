@@ -87,7 +87,24 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--model-id", type=str, default=DEFAULT_MODEL_ID)
     ap.add_argument("--revision", type=str, default=DEFAULT_REVISION)
     ap.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default="auto")
-    ap.add_argument("--batch-size", type=int, default=32)
+    ap.add_argument(
+        "--batch-size",
+        type=int,
+        default=32,
+        help="Internal clip/window batch size used inside the model encoder.",
+    )
+    ap.add_argument(
+        "--item-batch-size",
+        type=int,
+        default=0,
+        help="Override for maximum raw audio items per dataloader batch. <=0 means auto.",
+    )
+    ap.add_argument(
+        "--auto-item-batch-size",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Adapt audio item batches to an estimated clip/window budget derived from audio lengths.",
+    )
     ap.add_argument("--target-sr", type=int, default=None)
     ap.add_argument("--clip-seconds", type=float, default=None)
     ap.add_argument("--crop", choices=["center", "peak"], default=None)
@@ -241,6 +258,12 @@ def main() -> None:
     args = _parse_args()
     model_overrides, effective_model_kwargs = _build_model_overrides(args)
     explicit_tasks = _parse_csv(args.tasks) or list(MAEB_AUDIO_ONLY_TASKS)
+    item_batch_size_value = (
+        int(args.item_batch_size)
+        if int(args.item_batch_size) > 0
+        else (1 if bool(args.auto_item_batch_size) else int(args.batch_size))
+    )
+    item_batch_size_override = (None if int(args.item_batch_size) <= 0 else int(args.item_batch_size))
     tasks, task_source = _resolve_tasks(
         benchmark_name=args.benchmark_name,
         explicit_tasks=explicit_tasks,
@@ -270,7 +293,10 @@ def main() -> None:
         "model_id": args.model_id,
         "revision": args.revision,
         "device": args.device,
-        "batch_size": int(args.batch_size),
+        "item_batch_size_override": item_batch_size_override,
+        "item_batch_size_effective": int(item_batch_size_value),
+        "clip_batch_size": int(args.batch_size),
+        "auto_item_batch_size": bool(args.auto_item_batch_size),
         "benchmark_name": args.benchmark_name,
         "task_source": task_source,
         "tasks": [task.metadata.name for task in tasks],
@@ -287,7 +313,10 @@ def main() -> None:
     print(f"Revision: {args.revision}", flush=True)
     print(f"Reference: {DEFAULT_REFERENCE_URL}", flush=True)
     print(f"Device: {getattr(model, 'device_type', args.device)}", flush=True)
-    print(f"Embedding batch size: {int(args.batch_size)}", flush=True)
+    item_batch_label = "auto" if int(args.item_batch_size) <= 0 else str(int(args.item_batch_size))
+    print(f"Dataloader item batch size (max): {item_batch_label}", flush=True)
+    print(f"Auto item batch sizing: {int(bool(args.auto_item_batch_size))}", flush=True)
+    print(f"Embedding clip batch size: {int(args.batch_size)}", flush=True)
     print(f"Mode: {_mode_description(effective_model_kwargs)}", flush=True)
     print(f"Tasks: {len(tasks)}", flush=True)
     print(f"Output dir: {output_dir}", flush=True)
@@ -301,7 +330,14 @@ def main() -> None:
         overwrite_strategy=args.overwrite_strategy,
         show_progress_bar=bool(args.show_progress_bar),
         encode_kwargs={
-            "batch_size": int(args.batch_size),
+            "batch_size": int(item_batch_size_value),
+            "clip_batch_size": int(args.batch_size),
+            "audio_dynamic_batching": bool(args.auto_item_batch_size),
+            "audio_max_batch_items": item_batch_size_override,
+            "audio_clip_seconds": float(effective_model_kwargs["clip_seconds"]),
+            "audio_window_hop_seconds": float(effective_model_kwargs["window_hop_seconds"]),
+            "audio_full_clip": bool(effective_model_kwargs["full_clip"]),
+            "audio_sliding_window": bool(effective_model_kwargs["sliding_window"]),
             "show_progress_bar": bool(args.show_progress_bar),
         },
         num_proc=(None if args.num_proc <= 0 else int(args.num_proc)),

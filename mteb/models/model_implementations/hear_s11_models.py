@@ -407,7 +407,7 @@ class HeARS11AudioWrapper(AbsEncoder):
         **kwargs: Any,
     ) -> Array:
         del prompt_type
-        max_batch_size = int(kwargs.get("batch_size", 32))
+        max_batch_size = int(kwargs.get("clip_batch_size", kwargs.get("batch_size", 32)))
         if max_batch_size <= 0:
             max_batch_size = 32
         show_progress = bool(kwargs.get("show_progress_bar", True))

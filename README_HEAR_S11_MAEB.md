@@ -27,7 +27,7 @@ Run a single task first:
 python scripts/run_hear_s11_maeb.py \
   --device cuda \
   --tasks BeijingOpera \
-  --batch-size 32
+  --batch-size 512
 ```
 
 ## Full MAEB run
@@ -37,7 +37,7 @@ Run the full benchmark with the saved leaderboard settings:
 ```bash
 python scripts/run_hear_s11_maeb.py \
   --device cuda \
-  --batch-size 32
+  --batch-size 2048
 ```
 
 Important:
@@ -45,6 +45,9 @@ Important:
 - Do not pass model-shape overrides if you want the canonical leaderboard run.
 - The canonical run is the model default already baked into the registry entry.
 - Non-default overrides such as `--full-clip`, `--no-sliding-window`, `--clip-seconds`, or `--window-hop-seconds` will be tracked as an experiment variant.
+- `--item-batch-size` is optional. Leave it unset and the runner will infer a safe raw-audio batch cap from the audio-length distribution and your requested clip budget.
+- `--auto-item-batch-size` is enabled by default and shrinks audio batches based on estimated clip/window count from audio lengths.
+- `--batch-size` controls the internal clip/window batch inside `HeAR-s1.1`.
 
 ## Outputs
 

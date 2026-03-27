@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import io
 import logging
+import math
+import os
 import warnings
+from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import torch
-from datasets import Dataset, Image
+from datasets import Audio, Dataset, Image
 from torch.utils.data import DataLoader, default_collate
 
 from mteb.types import (
@@ -30,6 +34,198 @@ if TYPE_CHECKING:
     )
 
 logger = logging.getLogger(__name__)
+
+
+def _estimate_audio_duration_seconds(audio: Any) -> float | None:
+    if audio is None:
+        return None
+
+    if isinstance(audio, dict):
+        array = audio.get("array")
+        sampling_rate = audio.get("sampling_rate")
+        if array is not None and sampling_rate:
+            try:
+                return float(np.asarray(array).reshape(-1).shape[0]) / float(sampling_rate)
+            except Exception:
+                pass
+
+        data_bytes = audio.get("bytes")
+        path = audio.get("path")
+        try:
+            import soundfile as sf
+        except Exception:
+            sf = None
+        if sf is not None:
+            if data_bytes is not None:
+                try:
+                    info = sf.info(io.BytesIO(data_bytes))
+                    if info.samplerate:
+                        return float(info.frames) / float(info.samplerate)
+                except Exception:
+                    pass
+            if path and isinstance(path, str) and os.path.exists(path):
+                try:
+                    info = sf.info(path)
+                    if info.samplerate:
+                        return float(info.frames) / float(info.samplerate)
+                except Exception:
+                    pass
+        if data_bytes is not None:
+            # Coarse fallback when only compressed bytes are available.
+            return max(1.0, float(len(data_bytes)) / 32000.0)
+
+    array = getattr(audio, "array", None)
+    sampling_rate = getattr(audio, "sampling_rate", None) or getattr(audio, "sample_rate", None)
+    if array is not None and sampling_rate:
+        try:
+            return float(np.asarray(array).reshape(-1).shape[0]) / float(sampling_rate)
+        except Exception:
+            pass
+
+    if hasattr(audio, "get_all_samples"):
+        try:
+            samples = audio.get_all_samples()
+            data = getattr(samples, "data", None)
+            sampling_rate = getattr(samples, "sample_rate", None)
+            if data is not None and sampling_rate:
+                return float(np.asarray(data).reshape(-1).shape[0]) / float(sampling_rate)
+        except Exception:
+            pass
+
+    return None
+
+
+def _estimate_audio_clip_cost(
+    duration_seconds: float | None,
+    *,
+    clip_seconds: float,
+    hop_seconds: float,
+    full_clip: bool,
+    sliding_window: bool,
+) -> int:
+    if duration_seconds is None or not math.isfinite(duration_seconds) or duration_seconds <= 0:
+        return 1
+    if full_clip:
+        return max(1, int(math.ceil(duration_seconds / max(clip_seconds, 1e-6))))
+    if not sliding_window:
+        return 1
+    return max(1, 1 + int(math.ceil(max(0.0, duration_seconds - clip_seconds) / max(hop_seconds, 1e-6))))
+
+
+def _batch_indices_by_budget(
+    costs: list[int],
+    *,
+    target_budget: int,
+    max_batch_items: int,
+) -> list[list[int]]:
+    if target_budget <= 0:
+        target_budget = 1
+    if max_batch_items <= 0:
+        max_batch_items = 1
+
+    batches: list[list[int]] = []
+    current: list[int] = []
+    current_cost = 0
+    for idx, raw_cost in enumerate(costs):
+        cost = max(1, int(raw_cost))
+        if current and (len(current) >= max_batch_items or current_cost + cost > target_budget):
+            batches.append(current)
+            current = []
+            current_cost = 0
+        current.append(idx)
+        current_cost += cost
+        if len(current) >= max_batch_items or current_cost >= target_budget:
+            batches.append(current)
+            current = []
+            current_cost = 0
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _resolve_audio_max_batch_items(
+    costs: list[int],
+    *,
+    target_budget: int,
+    max_batch_items: int | None,
+) -> int:
+    if max_batch_items is not None and int(max_batch_items) > 0:
+        return int(max_batch_items)
+
+    if target_budget <= 0:
+        target_budget = 1
+    if not costs:
+        return 1
+
+    cost_array = np.asarray([max(1, int(cost)) for cost in costs], dtype=np.int32)
+    reference_cost = int(np.percentile(cost_array, 75))
+    reference_cost = max(1, reference_cost)
+    inferred = max(1, target_budget // reference_cost)
+    # Keep a conservative hard cap so short-clip datasets do not overwhelm torchcodec.
+    return max(4, min(64, inferred))
+
+
+def _maybe_disable_audio_decoding(
+    dataset: Dataset,
+    *,
+    audio_column_name: str,
+) -> Dataset:
+    feature = dataset.features.get(audio_column_name)
+    if not isinstance(feature, Audio) or not getattr(feature, "decode", False):
+        return dataset
+    return dataset.cast_column(
+        audio_column_name,
+        Audio(
+            sampling_rate=getattr(feature, "sampling_rate", None),
+            mono=getattr(feature, "mono", True),
+            decode=False,
+            id=getattr(feature, "id", None),
+        ),
+    )
+
+
+class _AudioBudgetBatchSampler:
+    def __init__(
+        self,
+        dataset: Dataset,
+        *,
+        audio_column_name: str,
+        target_clip_budget: int,
+        max_batch_items: int | None,
+        clip_seconds: float,
+        hop_seconds: float,
+        full_clip: bool,
+        sliding_window: bool,
+    ) -> None:
+        costs: list[int] = []
+        for audio in dataset[audio_column_name]:
+            duration_seconds = _estimate_audio_duration_seconds(audio)
+            costs.append(
+                _estimate_audio_clip_cost(
+                    duration_seconds,
+                    clip_seconds=clip_seconds,
+                    hop_seconds=hop_seconds,
+                    full_clip=full_clip,
+                    sliding_window=sliding_window,
+                )
+            )
+        self.target_clip_budget = max(1, int(target_clip_budget))
+        self.max_batch_items = _resolve_audio_max_batch_items(
+            costs,
+            target_budget=self.target_clip_budget,
+            max_batch_items=max_batch_items,
+        )
+        self._batches = _batch_indices_by_budget(
+            costs,
+            target_budget=self.target_clip_budget,
+            max_batch_items=self.max_batch_items,
+        )
+
+    def __iter__(self) -> Iterator[list[int]]:
+        yield from self._batches
+
+    def __len__(self) -> int:
+        return len(self._batches)
 
 
 def _create_dataloader_from_texts(
@@ -332,6 +528,49 @@ def create_dataloader(
         input_column=input_column,
         num_proc=num_proc,
     )
+
+    modalities = task_metadata.get_modalities(prompt_type)
+    audio_dynamic_batching = bool(kwargs.get("audio_dynamic_batching", False))
+    if "audio" in modalities and audio_dynamic_batching:
+        audio_column_name = "audio" if "audio" in prepared.column_names else input_column
+        if audio_column_name is not None and audio_column_name in prepared.column_names:
+            prepared = _maybe_disable_audio_decoding(
+                prepared,
+                audio_column_name=audio_column_name,
+            )
+            raw_max_batch_items = kwargs.get("audio_max_batch_items")
+            max_batch_items = (
+                int(raw_max_batch_items)
+                if raw_max_batch_items is not None and int(raw_max_batch_items) > 0
+                else None
+            )
+            target_clip_budget = int(kwargs.get("clip_batch_size", batch_size))
+            clip_seconds = float(kwargs.get("audio_clip_seconds", 2.0))
+            hop_seconds = float(kwargs.get("audio_window_hop_seconds", clip_seconds))
+            full_clip = bool(kwargs.get("audio_full_clip", False))
+            sliding_window = bool(kwargs.get("audio_sliding_window", False))
+            batch_sampler = _AudioBudgetBatchSampler(
+                prepared,
+                audio_column_name=audio_column_name,
+                target_clip_budget=target_clip_budget,
+                max_batch_items=max_batch_items,
+                clip_seconds=clip_seconds,
+                hop_seconds=hop_seconds,
+                full_clip=full_clip,
+                sliding_window=sliding_window,
+            )
+            logger.info(
+                "Audio dynamic batching enabled: target_clip_budget=%s max_batch_items=%s num_batches=%s",
+                batch_sampler.target_clip_budget,
+                batch_sampler.max_batch_items,
+                len(batch_sampler),
+            )
+            return DataLoader(
+                prepared,
+                batch_sampler=batch_sampler,
+                collate_fn=_custom_collate_fn,
+                num_workers=num_proc if num_proc is not None and num_proc > 1 else 0,
+            )
 
     return DataLoader(
         prepared,

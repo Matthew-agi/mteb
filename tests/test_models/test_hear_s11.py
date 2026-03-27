@@ -141,3 +141,49 @@ def test_hear_s11_sliding_window_batches_across_items(monkeypatch):
 
     assert embeddings.shape == (2, 384)
     assert recording_model.batch_sizes == [4, 2]
+
+
+def test_hear_s11_clip_batch_size_overrides_item_batch_size(monkeypatch):
+    recording_model = _RecordingHFModel()
+
+    monkeypatch.setattr(hear_s11_models, "requires_audio_dependencies", lambda: None)
+    monkeypatch.setattr(hear_s11_models, "requires_package", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        hear_s11_models,
+        "AutoModel",
+        SimpleNamespace(from_pretrained=lambda *args, **kwargs: recording_model),
+    )
+    monkeypatch.setattr(
+        hear_s11_models,
+        "_prep_audio_sliding_windows",
+        lambda *args, **kwargs: torch.arange(12, dtype=torch.float32).reshape(3, 4),
+    )
+
+    model = mteb.get_model("matthewagi/HeAR-s1.1", device="cpu")
+    samples = [
+        {
+            "audio": {
+                "array": np.ones(16000, dtype=np.float32),
+                "sampling_rate": 16000,
+            }
+        },
+        {
+            "audio": {
+                "array": np.zeros(16000, dtype=np.float32),
+                "sampling_rate": 16000,
+            }
+        },
+    ]
+    loader = DataLoader(samples, batch_size=2, shuffle=False, collate_fn=_collate_audio)
+    embeddings = model.encode(
+        loader,
+        task_metadata=SimpleNamespace(name="DummyAudioTask"),
+        hf_split="test",
+        hf_subset="default",
+        batch_size=1,
+        clip_batch_size=4,
+        show_progress_bar=False,
+    )
+
+    assert embeddings.shape == (2, 384)
+    assert recording_model.batch_sizes == [4, 2]
